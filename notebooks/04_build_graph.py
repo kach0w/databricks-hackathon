@@ -1,29 +1,20 @@
 # Databricks notebook source
-# MAGIC %md # 04 — Build GraphFrames
-# MAGIC Constructs vertex and edge tables persisted to Delta.
+# MAGIC %md # 04 — Build Graph Tables
 # MAGIC Spatial join maps facility lat/lon → India district using GADM shapefile.
-# MAGIC
-# MAGIC Prerequisites:
-# MAGIC   - Attach the GraphFrames JAR to your cluster:
-# MAGIC     Maven coord: graphframes:graphframes:0.8.3-spark3.5-s_2.12
-# MAGIC   - pip install geopandas shapely requests
+# MAGIC Builds vertex and edge Delta tables traversed via SQL joins in notebook 05 and the app.
 
 # COMMAND ----------
-# %pip install geopandas shapely requests
-# (uncomment and run first, then restart Python, then run the rest)
+%pip install geopandas shapely requests
 
 # COMMAND ----------
-import json
 import os
-import requests
-import zipfile
 import io
+import zipfile
+import requests
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType
-from graphframes import GraphFrame
 
 CATALOG = "main"
 SCHEMA  = "medical_desert"
@@ -32,7 +23,7 @@ SCHEMA  = "medical_desert"
 # ── Download GADM India district shapefile ────────────────────────────────────
 GADM_URL  = "https://geodata.ucdavis.edu/gadm/gadm4.1/shp/gadm41_IND_shp.zip"
 GADM_DIR  = "/tmp/gadm_india"
-GADM_FILE = f"{GADM_DIR}/gadm41_IND_2.shp"   # level 2 = districts
+GADM_FILE = f"{GADM_DIR}/gadm41_IND_2.shp"
 
 if not os.path.exists(GADM_FILE):
     os.makedirs(GADM_DIR, exist_ok=True)
@@ -41,31 +32,31 @@ if not os.path.exists(GADM_FILE):
     r.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
         z.extractall(GADM_DIR)
-    print("Downloaded.")
+    print("Done.")
 
-districts_gdf = gpd.read_file(GADM_FILE)
-# GADM columns: NAME_1 = state, NAME_2 = district
-districts_gdf = districts_gdf[["NAME_1", "NAME_2", "geometry"]].copy()
+districts_gdf = gpd.read_file(GADM_FILE)[["NAME_1", "NAME_2", "geometry"]]
 districts_gdf.columns = ["gadm_state", "gadm_district", "geometry"]
+districts_gdf = districts_gdf.set_crs("EPSG:4326")
 print(f"Loaded {len(districts_gdf)} district polygons")
 
 # COMMAND ----------
 # ── Spatial join: facilities → districts ──────────────────────────────────────
 fac = spark.read.table(f"{CATALOG}.{SCHEMA}.facilities_clean")
-fac_valid = fac.filter("lat_valid = true AND latitude IS NOT NULL AND longitude IS NOT NULL")
 
-fac_pd = fac_valid.select(
+fac_pd = fac.select(
     "unique_id", "name", "address_stateOrRegion", "address_city",
-    "latitude", "longitude", "facilityTypeId", "operatorTypeId",
-    "affiliationTypeIds"
+    "latitude", "longitude", "facilityTypeId", "operatorTypeId", "affiliationTypeIds"
 ).toPandas()
 
+# Only spatially join rows with valid coords; rest get empty district
+fac_valid = fac_pd[fac_pd["latitude"].notna() & fac_pd["longitude"].notna()].copy()
+fac_invalid = fac_pd[~fac_pd["unique_id"].isin(fac_valid["unique_id"])].copy()
+
 fac_gdf = gpd.GeoDataFrame(
-    fac_pd,
-    geometry=[Point(lon, lat) for lat, lon in zip(fac_pd.latitude, fac_pd.longitude)],
+    fac_valid,
+    geometry=[Point(lon, lat) for lat, lon in zip(fac_valid.longitude, fac_valid.latitude)],
     crs="EPSG:4326"
 )
-districts_gdf = districts_gdf.set_crs("EPSG:4326")
 
 joined = gpd.sjoin(fac_gdf, districts_gdf, how="left", predicate="within")
 joined["gadm_district"] = joined["gadm_district"].fillna("")
@@ -76,33 +67,30 @@ joined["district_id"] = (
     + joined["gadm_state"].str.lower().str.strip().str.replace(r"\s+", "_", regex=True)
 )
 
-# Facilities with no polygon match: fall back to string-matched district
-fac_all_pd = fac.toPandas()
-fac_no_match = fac_all_pd[~fac_all_pd["unique_id"].isin(joined["unique_id"])]
-fac_no_match = fac_no_match.copy()
-fac_no_match["district_id"] = ""
-fac_no_match["gadm_district"] = ""
-fac_no_match["gadm_state"] = ""
+fac_invalid["gadm_district"] = ""
+fac_invalid["gadm_state"]    = ""
+fac_invalid["district_id"]   = ""
 
-fac_located = pd.concat([
-    joined[["unique_id", "district_id", "gadm_district", "gadm_state"]],
-    fac_no_match[["unique_id", "district_id", "gadm_district", "gadm_state"]],
-], ignore_index=True)
+fac_located_pd = pd.concat(
+    [joined[["unique_id", "district_id", "gadm_district", "gadm_state"]],
+     fac_invalid[["unique_id", "district_id", "gadm_district", "gadm_state"]]],
+    ignore_index=True
+)
 
-fac_located_spark = spark.createDataFrame(fac_located)
+fac_located_spark = spark.createDataFrame(fac_located_pd)
 fac_with_district = fac.join(fac_located_spark, on="unique_id", how="left")
 fac_with_district.write.format("delta").mode("overwrite") \
     .saveAsTable(f"{CATALOG}.{SCHEMA}.facilities_located")
 
-matched = fac_located[fac_located.district_id != ""].shape[0]
-print(f"Spatial join: {matched}/{len(fac_all_pd)} facilities matched to a district")
+matched = fac_located_pd[fac_located_pd.district_id != ""].shape[0]
+print(f"Spatial join: {matched}/{len(fac_pd)} facilities matched to a district")
 
 # COMMAND ----------
-# ── Build Vertices ────────────────────────────────────────────────────────────
-nfhs     = spark.read.table(f"{CATALOG}.{SCHEMA}.nfhs_clean")
-fac_loc  = spark.read.table(f"{CATALOG}.{SCHEMA}.facilities_located")
+# ── Vertices ──────────────────────────────────────────────────────────────────
+nfhs        = spark.read.table(f"{CATALOG}.{SCHEMA}.nfhs_clean")
+fac_loc     = spark.read.table(f"{CATALOG}.{SCHEMA}.facilities_located")
+dist_scores = spark.read.table(f"{CATALOG}.{SCHEMA}.district_scores")
 
-# Facility vertices
 v_fac = fac_loc.select(
     F.concat(F.lit("fac__"), F.col("unique_id")).alias("id"),
     F.lit("facility").alias("type"),
@@ -117,8 +105,6 @@ v_fac = fac_loc.select(
     F.lit(None).cast("boolean").alias("nfhs_low_confidence"),
 )
 
-# District vertices (from NFHS)
-dist_scores = spark.read.table(f"{CATALOG}.{SCHEMA}.district_scores")
 v_dist = dist_scores.select(
     F.concat(F.lit("dist__"), F.col("district_id")).alias("id"),
     F.lit("district").alias("type"),
@@ -133,7 +119,6 @@ v_dist = dist_scores.select(
     F.col("nfhs_low_confidence"),
 )
 
-# State vertices
 v_state = nfhs.select(
     F.concat(F.lit("state__"),
         F.lower(F.regexp_replace(F.trim(F.col("state_ut")), r"\s+", "_"))
@@ -156,10 +141,9 @@ vertices.write.format("delta").mode("overwrite") \
 print(f"Vertices: {vertices.count()}")
 
 # COMMAND ----------
-# ── Build Edges ───────────────────────────────────────────────────────────────
+# ── Edges ─────────────────────────────────────────────────────────────────────
 scores = spark.read.table(f"{CATALOG}.{SCHEMA}.facility_capability_scores")
 
-# Edge: facility → district (located_in)
 e_located = fac_loc.filter("district_id IS NOT NULL AND district_id != ''").select(
     F.concat(F.lit("fac__"), F.col("unique_id")).alias("src"),
     F.concat(F.lit("dist__"), F.col("district_id")).alias("dst"),
@@ -171,7 +155,6 @@ e_located = fac_loc.filter("district_id IS NOT NULL AND district_id != ''").sele
     F.array().cast("array<string>").alias("evidence_quotes"),
 )
 
-# Edge: facility → capability (claims_capability)
 e_claims = scores.select(
     F.concat(F.lit("fac__"), F.col("facility_id")).alias("src"),
     F.concat(F.lit("cap__"), F.col("capability")).alias("dst"),
@@ -183,7 +166,6 @@ e_claims = scores.select(
     F.col("evidence_quotes"),
 )
 
-# Edge: district → state (part_of)
 e_part_of = dist_scores.select(
     F.concat(F.lit("dist__"), F.col("district_id")).alias("src"),
     F.concat(F.lit("state__"),
@@ -203,19 +185,18 @@ edges.write.format("delta").mode("overwrite") \
 print(f"Edges: {edges.count()}")
 
 # COMMAND ----------
-# ── Validate GraphFrame ───────────────────────────────────────────────────────
-g = GraphFrame(
-    spark.read.table(f"{CATALOG}.{SCHEMA}.graph_vertices"),
-    spark.read.table(f"{CATALOG}.{SCHEMA}.graph_edges"),
-)
-
-print(f"Graph: {g.vertices.count()} vertices, {g.edges.count()} edges")
-
-# Sample query: districts with strong ICU claims
-strong_icu = (
-    g.find("(f)-[e]->(d)")
-     .filter("e.relationship = 'claims_capability' AND e.capability = 'icu' AND e.strength = 'strong'")
-     .filter("d.type = 'district'")
-     .select("d.name", "d.id", "f.name", "e.evidence_score")
-)
-print(f"Districts with strong ICU evidence: {strong_icu.select('d.id').distinct().count()}")
+# ── Validate with plain SQL ───────────────────────────────────────────────────
+strong_icu = spark.sql(f"""
+    SELECT DISTINCT v_dist.name AS district
+    FROM {CATALOG}.{SCHEMA}.graph_edges e_claims
+    JOIN {CATALOG}.{SCHEMA}.graph_edges e_located
+      ON REPLACE(e_claims.src, 'fac__', '') = REPLACE(e_located.src, 'fac__', '')
+    JOIN {CATALOG}.{SCHEMA}.graph_vertices v_dist
+      ON e_located.dst = v_dist.id
+    WHERE e_claims.relationship = 'claims_capability'
+      AND e_claims.capability   = 'icu'
+      AND e_claims.strength     = 'strong'
+      AND e_located.relationship = 'located_in'
+      AND v_dist.type = 'district'
+""")
+print(f"Districts with strong ICU evidence: {strong_icu.count()}")
