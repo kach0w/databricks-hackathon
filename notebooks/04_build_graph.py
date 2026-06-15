@@ -1,95 +1,116 @@
 # Databricks notebook source
 # MAGIC %md # 04 — Build Graph Tables
-# MAGIC Spatial join maps facility lat/lon → India district using GADM shapefile.
-# MAGIC Builds vertex and edge Delta tables traversed via SQL joins in notebook 05 and the app.
+# MAGIC Matches facilities to NFHS districts via state name + city→district fuzzy text matching.
+# MAGIC No shapefile needed — runs fully on serverless.
 
 # COMMAND ----------
-%pip install geopandas shapely requests
-
-# COMMAND ----------
-import os
-import io
-import zipfile
-import requests
-import geopandas as gpd
 import pandas as pd
-from shapely.geometry import Point
+from difflib import get_close_matches
 from pyspark.sql import functions as F
 
 CATALOG = "main"
 SCHEMA  = "medical_desert"
 
 # COMMAND ----------
-# ── Download GADM India district shapefile ────────────────────────────────────
-GADM_URL  = "https://geodata.ucdavis.edu/gadm/gadm4.1/shp/gadm41_IND_shp.zip"
-GADM_DIR  = "/tmp/gadm_india"
-GADM_FILE = f"{GADM_DIR}/gadm41_IND_2.shp"
+# ── Build district lookup from NFHS ──────────────────────────────────────────
+nfhs        = spark.read.table(f"{CATALOG}.{SCHEMA}.nfhs_clean")
+dist_scores = spark.read.table(f"{CATALOG}.{SCHEMA}.district_scores")
+fac         = spark.read.table(f"{CATALOG}.{SCHEMA}.facilities_clean")
 
-if not os.path.exists(GADM_FILE):
-    os.makedirs(GADM_DIR, exist_ok=True)
-    print("Downloading GADM India shapefile (~30MB)...")
-    r = requests.get(GADM_URL, timeout=120)
-    r.raise_for_status()
-    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-        z.extractall(GADM_DIR)
-    print("Done.")
+nfhs_pd = nfhs.select("district_id", "district_name", "state_ut").toPandas()
+nfhs_pd["state_norm"]    = nfhs_pd["state_ut"].str.lower().str.strip()
+nfhs_pd["district_norm"] = nfhs_pd["district_name"].str.lower().str.strip()
 
-districts_gdf = gpd.read_file(GADM_FILE)[["NAME_1", "NAME_2", "geometry"]]
-districts_gdf.columns = ["gadm_state", "gadm_district", "geometry"]
-districts_gdf = districts_gdf.set_crs("EPSG:4326")
-print(f"Loaded {len(districts_gdf)} district polygons")
+# state → list of (district_norm, district_id)
+state_districts = (
+    nfhs_pd.groupby("state_norm")
+    .apply(lambda g: list(zip(g["district_norm"], g["district_id"])))
+    .to_dict()
+)
+
+# Common alternate state name spellings in facility data
+STATE_ALIASES = {
+    "uttarakhand": "uttarakhand", "uttaranchal": "uttarakhand",
+    "jammu & kashmir": "jammu and kashmir", "j&k": "jammu and kashmir",
+    "andaman and nicobar": "andaman & nicobar islands",
+    "andaman & nicobar": "andaman & nicobar islands",
+    "dadra and nagar haveli": "dadra & nagar haveli and daman & diu",
+    "daman and diu": "dadra & nagar haveli and daman & diu",
+    "delhi": "delhi", "new delhi": "delhi",
+    "pondicherry": "puducherry",
+}
+
+def norm_state(s):
+    if not s:
+        return ""
+    s = s.lower().strip()
+    return STATE_ALIASES.get(s, s)
+
+def match_district(state_raw, city_raw):
+    """Return district_id or empty string."""
+    state = norm_state(state_raw)
+    if state not in state_districts:
+        # try partial match on state name
+        candidates = [k for k in state_districts if state in k or k in state]
+        if not candidates:
+            return ""
+        state = candidates[0]
+
+    districts = state_districts[state]   # [(district_norm, district_id), ...]
+    dist_names = [d[0] for d in districts]
+    dist_map   = {d[0]: d[1] for d in districts}
+
+    if not city_raw:
+        return ""
+
+    city = city_raw.lower().strip()
+
+    # 1. Exact match
+    if city in dist_map:
+        return dist_map[city]
+
+    # 2. City is contained in a district name or vice versa
+    for dname, did in districts:
+        if city in dname or dname in city:
+            return did
+
+    # 3. Fuzzy match (cutoff=0.7 is conservative enough to avoid bad matches)
+    close = get_close_matches(city, dist_names, n=1, cutoff=0.7)
+    if close:
+        return dist_map[close[0]]
+
+    return ""
 
 # COMMAND ----------
-# ── Spatial join: facilities → districts ──────────────────────────────────────
-fac = spark.read.table(f"{CATALOG}.{SCHEMA}.facilities_clean")
-
+# ── Match all facilities ──────────────────────────────────────────────────────
 fac_pd = fac.select(
     "unique_id", "name", "address_stateOrRegion", "address_city",
     "latitude", "longitude", "facilityTypeId", "operatorTypeId", "affiliationTypeIds"
 ).toPandas()
 
-# Only spatially join rows with valid coords; rest get empty district
-fac_valid = fac_pd[fac_pd["latitude"].notna() & fac_pd["longitude"].notna()].copy()
-fac_invalid = fac_pd[~fac_pd["unique_id"].isin(fac_valid["unique_id"])].copy()
-
-fac_gdf = gpd.GeoDataFrame(
-    fac_valid,
-    geometry=[Point(lon, lat) for lat, lon in zip(fac_valid.longitude, fac_valid.latitude)],
-    crs="EPSG:4326"
+fac_pd["district_id"] = fac_pd.apply(
+    lambda r: match_district(r["address_stateOrRegion"], r["address_city"]), axis=1
 )
 
-joined = gpd.sjoin(fac_gdf, districts_gdf, how="left", predicate="within")
-joined["gadm_district"] = joined["gadm_district"].fillna("")
-joined["gadm_state"]    = joined["gadm_state"].fillna("")
-joined["district_id"] = (
-    joined["gadm_district"].str.lower().str.strip().str.replace(r"\s+", "_", regex=True)
-    + "__"
-    + joined["gadm_state"].str.lower().str.strip().str.replace(r"\s+", "_", regex=True)
+matched = (fac_pd["district_id"] != "").sum()
+print(f"Matched {matched}/{len(fac_pd)} facilities to an NFHS district")
+
+# Sample matches to verify
+print(fac_pd[fac_pd["district_id"] != ""][
+    ["name", "address_stateOrRegion", "address_city", "district_id"]
+].head(10).to_string())
+
+# COMMAND ----------
+fac_located_spark = spark.createDataFrame(
+    fac_pd[["unique_id", "district_id"]]
 )
-
-fac_invalid["gadm_district"] = ""
-fac_invalid["gadm_state"]    = ""
-fac_invalid["district_id"]   = ""
-
-fac_located_pd = pd.concat(
-    [joined[["unique_id", "district_id", "gadm_district", "gadm_state"]],
-     fac_invalid[["unique_id", "district_id", "gadm_district", "gadm_state"]]],
-    ignore_index=True
-)
-
-fac_located_spark = spark.createDataFrame(fac_located_pd)
 fac_with_district = fac.join(fac_located_spark, on="unique_id", how="left")
 fac_with_district.write.format("delta").mode("overwrite") \
     .saveAsTable(f"{CATALOG}.{SCHEMA}.facilities_located")
 
-matched = fac_located_pd[fac_located_pd.district_id != ""].shape[0]
-print(f"Spatial join: {matched}/{len(fac_pd)} facilities matched to a district")
-
 # COMMAND ----------
 # ── Vertices ──────────────────────────────────────────────────────────────────
-nfhs        = spark.read.table(f"{CATALOG}.{SCHEMA}.nfhs_clean")
-fac_loc     = spark.read.table(f"{CATALOG}.{SCHEMA}.facilities_located")
-dist_scores = spark.read.table(f"{CATALOG}.{SCHEMA}.district_scores")
+fac_loc = spark.read.table(f"{CATALOG}.{SCHEMA}.facilities_located")
 
 v_fac = fac_loc.select(
     F.concat(F.lit("fac__"), F.col("unique_id")).alias("id"),
@@ -185,18 +206,12 @@ edges.write.format("delta").mode("overwrite") \
 print(f"Edges: {edges.count()}")
 
 # COMMAND ----------
-# ── Validate with plain SQL ───────────────────────────────────────────────────
-strong_icu = spark.sql(f"""
-    SELECT DISTINCT v_dist.name AS district
-    FROM {CATALOG}.{SCHEMA}.graph_edges e_claims
-    JOIN {CATALOG}.{SCHEMA}.graph_edges e_located
-      ON REPLACE(e_claims.src, 'fac__', '') = REPLACE(e_located.src, 'fac__', '')
-    JOIN {CATALOG}.{SCHEMA}.graph_vertices v_dist
-      ON e_located.dst = v_dist.id
-    WHERE e_claims.relationship = 'claims_capability'
-      AND e_claims.capability   = 'icu'
-      AND e_claims.strength     = 'strong'
-      AND e_located.relationship = 'located_in'
-      AND v_dist.type = 'district'
-""")
-print(f"Districts with strong ICU evidence: {strong_icu.count()}")
+# ── Validate ──────────────────────────────────────────────────────────────────
+spark.sql(f"""
+    SELECT e.dst AS district_id, COUNT(*) AS facility_count
+    FROM {CATALOG}.{SCHEMA}.graph_edges e
+    WHERE e.relationship = 'located_in'
+    GROUP BY e.dst
+    ORDER BY facility_count DESC
+    LIMIT 10
+""").show(truncate=False)
