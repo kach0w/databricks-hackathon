@@ -7,6 +7,7 @@
 import json
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, ArrayType
+import pandas as pd
 
 CATALOG = "main"
 SCHEMA  = "medical_desert"
@@ -183,29 +184,35 @@ SCHEMA_OUT = StructType([
     StructField("strength",        StringType()),
 ])
 
-def score_row(row):
-    results = []
-    for cap_name in CAPABILITIES:
-        score, fields, quotes, strength = score_facility(
-            row.specialties,
-            row.affiliationTypeIds,
-            row.capability,
-            row.procedure,
-            row.equipment,
-            row.description,
-            cap_name,
-        )
-        results.append((
-            row.unique_id, cap_name,
-            float(score), fields, quotes, strength,
-        ))
-    return results
+def score_partition(pdf_iter):
+    import pandas as pd
+    for pdf in pdf_iter:
+        rows = []
+        for _, row in pdf.iterrows():
+            for cap_name in CAPABILITIES:
+                score, fields, quotes, strength = score_facility(
+                    row.get("specialties") or [],
+                    row.get("affiliationTypeIds") or [],
+                    row.get("capability") or [],
+                    row.get("procedure") or [],
+                    row.get("equipment") or [],
+                    row.get("description"),
+                    cap_name,
+                )
+                rows.append({
+                    "facility_id":     row["unique_id"],
+                    "capability":      cap_name,
+                    "evidence_score":  float(score),
+                    "evidence_fields": fields,
+                    "evidence_quotes": quotes,
+                    "strength":        strength,
+                })
+        yield pd.DataFrame(rows)
 
 # COMMAND ----------
 fac = spark.read.table(f"{CATALOG}.{SCHEMA}.facilities_clean")
 
-rdd_scored = fac.rdd.flatMap(score_row)
-df_scores = spark.createDataFrame(rdd_scored, schema=SCHEMA_OUT)
+df_scores = fac.mapInPandas(score_partition, schema=SCHEMA_OUT)
 
 # Only keep rows where there's at least a weak signal
 df_scores = df_scores.filter(F.col("evidence_score") > 0)
