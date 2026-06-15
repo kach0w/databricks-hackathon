@@ -46,6 +46,27 @@ export DATABRICKS_HOST="..."
 export DATABRICKS_TOKEN="..."
 ```
 
+## Databricks Agent Skills (run once per machine)
+
+Official Databricks skills teach Claude Code the platform's CLI conventions, auth patterns, and resource APIs so it generates correct code without guessing. Install with the Databricks CLI:
+
+```bash
+databricks aitools install --agents claude-code --skills databricks-core,databricks-lakebase,databricks-apps,databricks-dabs
+```
+
+Skills install to `~/.databricks/aitools/skills/` (user-global). Keep them current:
+
+```bash
+databricks aitools update   # pull latest before hacking
+databricks aitools list     # verify what's installed
+```
+
+Skills installed:
+- `databricks-core` — CLI operations and authentication
+- `databricks-lakebase` — Postgres Autoscaling project management
+- `databricks-apps` — building UI with AppKit
+- `databricks-dabs` — declarative resource deployment (infra-as-code)
+
 ## Commands
 
 Add build/test/lint commands here as the project takes shape:
