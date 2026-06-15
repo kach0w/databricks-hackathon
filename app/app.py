@@ -4,8 +4,7 @@ Run with: gradio app.py
 """
 import json
 import os
-import psycopg2
-import psycopg2.extras
+import sqlite3
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
@@ -18,7 +17,7 @@ SCHEMA    = os.getenv("SCHEMA",    "medical_desert")
 DB_HOST   = os.getenv("DATABRICKS_HOST")
 DB_TOKEN  = os.getenv("DATABRICKS_TOKEN")
 DB_WH_ID  = os.getenv("DATABRICKS_WAREHOUSE_ID")
-PG_DSN    = os.getenv("LAKEBASE_CONNECTION_STRING")
+SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/medical_desert.db")
 
 CAPABILITIES = ["icu", "maternity", "emergency", "dialysis", "nicu", "oncology"]
 
@@ -51,8 +50,31 @@ def _sql(query: str) -> pd.DataFrame:
             return pd.DataFrame(cur.fetchall(), columns=cols)
 
 
-def _pg():
-    return psycopg2.connect(PG_DSN)
+def _sqlite():
+    conn = sqlite3.connect(SQLITE_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""CREATE TABLE IF NOT EXISTS scenarios (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        capability TEXT NOT NULL,
+        description TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS scenario_regions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scenario_id INTEGER REFERENCES scenarios(id),
+        district_id TEXT NOT NULL,
+        district_name TEXT NOT NULL,
+        state_ut TEXT NOT NULL,
+        classification TEXT NOT NULL,
+        health_risk_score REAL,
+        coverage_score REAL,
+        planner_flag TEXT,
+        note TEXT,
+        reviewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.commit()
+    return conn
 
 
 # ── Map tab ───────────────────────────────────────────────────────────────────
@@ -148,14 +170,12 @@ def save_scenario(name: str, capability: str, description: str) -> str:
     if not name.strip():
         return "Scenario name is required."
     try:
-        with _pg() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO scenarios (name, capability, description) VALUES (%s,%s,%s) RETURNING id",
-                    (name.strip(), capability, description.strip()),
-                )
-                sid = cur.fetchone()[0]
-            conn.commit()
+        with _sqlite() as conn:
+            cur = conn.execute(
+                "INSERT INTO scenarios (name, capability, description) VALUES (?,?,?)",
+                (name.strip(), capability, description.strip()),
+            )
+            sid = cur.lastrowid
         return f"Saved scenario '{name}' (ID: {sid})"
     except Exception as e:
         return f"Error: {e}"
@@ -169,21 +189,19 @@ def flag_region(
     if not scenario_id or not district_name:
         return "Provide a scenario ID and district."
     try:
-        with _pg() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO scenario_regions
-                        (scenario_id, district_id, district_name, state_ut,
-                         classification, health_risk_score, coverage_score,
-                         planner_flag, note)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    scenario_id,
-                    district_name.lower().replace(" ", "_") + "__" + state.lower().replace(" ", "_"),
-                    district_name, state,
-                    classification, health_risk, coverage, flag, note,
-                ))
-            conn.commit()
+        with _sqlite() as conn:
+            conn.execute("""
+                INSERT INTO scenario_regions
+                    (scenario_id, district_id, district_name, state_ut,
+                     classification, health_risk_score, coverage_score,
+                     planner_flag, note)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                int(scenario_id),
+                district_name.lower().replace(" ", "_") + "__" + state.lower().replace(" ", "_"),
+                district_name, state,
+                classification, health_risk, coverage, flag, note,
+            ))
         return f"Flagged {district_name} as '{flag}'"
     except Exception as e:
         return f"Error: {e}"
@@ -191,10 +209,11 @@ def flag_region(
 
 def list_scenarios() -> pd.DataFrame:
     try:
-        with _pg() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("SELECT id, name, capability, created_at FROM scenarios ORDER BY created_at DESC LIMIT 20")
-                return pd.DataFrame(cur.fetchall())
+        with _sqlite() as conn:
+            rows = conn.execute(
+                "SELECT id, name, capability, created_at FROM scenarios ORDER BY created_at DESC LIMIT 20"
+            ).fetchall()
+            return pd.DataFrame([dict(r) for r in rows])
     except Exception as e:
         return pd.DataFrame({"error": [str(e)]})
 
